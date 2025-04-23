@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+onnxruntime
+opencv-python
+mediapipe
+python-multipart
+scikit-learn
+pandas
+numpy
+torch
+onnx

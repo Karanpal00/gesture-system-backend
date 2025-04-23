@@ -1,0 +1,19 @@
+{
+  "thumbs_up": {
+    "key": "volume_up",
+    "images": [
+      "orig_1.jpg",
+      "orig_1_blur.jpg",
+      "orig_1_bright.jpg",
+      "orig_1_flip.jpg",
+      "orig_1_rot-15.jpg",
+      "orig_1_rot15.jpg",
+      "orig_2.jpg",
+      "orig_2_blur.jpg",
+      "orig_2_bright.jpg",
+      "orig_2_flip.jpg",
+      "orig_2_rot-15.jpg",
+      "orig_2_rot15.jpg"
+    ]
+  }
+}
