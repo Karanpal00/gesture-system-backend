@@ -47,6 +47,9 @@ class Keypoints(BaseModel):
     keypoints: List[float]
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
+@app.get("/")
+async def root():
+    return {"status": "gesture backend is running"}
 
 @app.post("/register_face")
 async def register_face(username: str = Form(...), file: UploadFile = File(...)):
