@@ -7,7 +7,8 @@ data/gestures/<gesture_name>/ for images, extract MediaPipe
 hand landmarks, and produce a single CSV under data/processed/.
 Run: python scripts/train_model_pt.py
 """
-
+import os, pathlib
+os.environ["MPLCONFIGDIR"] = "/tmp/mpl"
 import sys
 import logging
 import pathlib
