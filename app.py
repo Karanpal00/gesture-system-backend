@@ -28,7 +28,8 @@ app = FastAPI(title="Gesture Control Backend")
 # Allow your React frontend (or any origin) to call these endpoints
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5001"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
