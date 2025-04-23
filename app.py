@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
@@ -19,16 +19,18 @@ GESTURES_JSON  = DATA_DIR / "gestures.json"
 sys.path.append(str(SCRIPTS_DIR))
 sys.path.append(str(INFERENCE_DIR))
 
-import augment                 # scripts/augment.py
-import gesture_infer           # inference/gesture_infer.py
+import augment       # scripts/augment.py
+import gesture_infer # inference/gesture_infer.py
 
 # ─── FastAPI app ──────────────────────────────────────────────────────────────
 app = FastAPI(title="Gesture Control Backend")
 
-# Allow your React frontend (or any origin) to call these endpoints
+# ─── CORS (must list explicit origins when allow_credentials=True) ────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5001"],
+    allow_origins=[
+        "http://localhost:5001",            # your React dev server
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -47,16 +49,23 @@ if not GESTURES_JSON.exists():
 class Keypoints(BaseModel):
     keypoints: List[float]
 
+# ─── Utility to kick off training in background ───────────────────────────────
+def _run_training():
+    # stdout/stderr will go to your Render/Loggly logs
+    subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "train_model_pt.py")],
+        capture_output=False,
+        text=True
+    )
+
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
     return {"status": "gesture backend is running"}
 
+
 @app.post("/register_face")
 async def register_face(username: str = Form(...), file: UploadFile = File(...)):
-    """
-    Save a single face image under data/faces/<username>.<ext>
-    """
     ext = Path(file.filename).suffix or ".jpg"
     out_path = FACES_DIR / f"{username}{ext}"
     with open(out_path, "wb") as buf:
@@ -70,9 +79,6 @@ async def register_gesture(
     key: str          = Form(...),
     files: List[UploadFile] = File(...)
 ):
-    """
-    Save uploaded images, augment them, and update gestures.json.
-    """
     # 1) Save originals
     gesture_folder = GESTURES_DIR / gesture_name
     gesture_folder.mkdir(parents=True, exist_ok=True)
@@ -112,27 +118,17 @@ async def register_gesture(
 
 
 @app.post("/train_model")
-async def train_model():
+async def train_model(background_tasks: BackgroundTasks):
     """
-    Run your existing PyTorch training script to regenerate ONNX + meta.
+    Kick off the PyTorch training script in the background.
+    Returns immediately so the front-end can show a spinner/poll status.
     """
-    result = subprocess.run(
-        [sys.executable, str(SCRIPTS_DIR / "train_model_pt.py")],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        raise HTTPException(status_code=500, detail=result.stderr)
-    return {
-        "message": "Model retrained successfully.",
-        "logs": result.stdout.splitlines()
-    }
+    background_tasks.add_task(_run_training)
+    return {"status": "training_started"}
 
 
 @app.post("/predict")
 async def predict(keypoints: Keypoints):
-    """
-    Accepts a list of 63 floats → returns {"gesture", "keybinding"}.
-    """
     kp = keypoints.keypoints
     if len(kp) != 63:
         raise HTTPException(status_code=400,
@@ -143,9 +139,6 @@ async def predict(keypoints: Keypoints):
 
 @app.get("/gestures")
 async def list_gestures():
-    """
-    Return the full gestures.json mapping.
-    """
     with open(GESTURES_JSON) as f:
         return json.load(f)
 
