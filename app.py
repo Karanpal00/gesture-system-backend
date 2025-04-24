@@ -5,45 +5,27 @@ from typing import List
 from pathlib import Path
 import subprocess, shutil, json, sys, os
 
-# ─── Setup paths ─────────────────────────────────────────────────────────────
-BASE_DIR       = Path(__file__).parent
-SCRIPTS_DIR    = BASE_DIR / "scripts"
-INFERENCE_DIR  = BASE_DIR / "inference"
-DATA_DIR       = BASE_DIR / "data"
-GESTURES_DIR   = DATA_DIR / "gestures"
-FACES_DIR      = DATA_DIR / "faces"
-PROCESSED_DIR  = DATA_DIR / "processed"
-GESTURES_JSON  = DATA_DIR / "gestures.json"
+# ─── Database setup ────────────────────────────────────────────────────────────
+from db import engine, Base, SessionLocal, Face, Gesture, GestureImage
+from sqlalchemy.exc import SQLAlchemyError
 
-# Make sure Python can import our helper scripts
-sys.path.append(str(SCRIPTS_DIR))
-sys.path.append(str(INFERENCE_DIR))
-
-import augment       # scripts/augment.py
-import gesture_infer # inference/gesture_infer.py
-
-# ─── FastAPI app ──────────────────────────────────────────────────────────────
+# Create tables on startup
 app = FastAPI(title="Gesture Control Backend")
 
-# ─── CORS (must list explicit origins when allow_credentials=True) ────────────
+@app.on_event("startup")
+def create_tables():
+    Base.metadata.create_all(bind=engine)
+
+# ─── CORS (explicit origins for credentials) ─────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5001",            # your React dev server
+        "http://localhost:5001",            # React dev server
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ─── Ensure storage dirs & metadata file exist ───────────────────────────────
-for d in (GESTURES_DIR, FACES_DIR, PROCESSED_DIR):
-    d.mkdir(parents=True, exist_ok=True)
-
-if not GESTURES_JSON.exists():
-    GESTURES_JSON.parent.mkdir(parents=True, exist_ok=True)
-    with open(GESTURES_JSON, "w") as f:
-        json.dump({}, f)
 
 # ─── Data models ──────────────────────────────────────────────────────────────
 class Keypoints(BaseModel):
@@ -51,9 +33,8 @@ class Keypoints(BaseModel):
 
 # ─── Utility to kick off training in background ───────────────────────────────
 def _run_training():
-    # stdout/stderr will go to your Render/Loggly logs
     subprocess.run(
-        [sys.executable, str(SCRIPTS_DIR / "train_model_pt.py")],
+        [sys.executable, str(Path(__file__).parent / "scripts" / "train_model_pt.py")],
         capture_output=False,
         text=True
     )
@@ -63,15 +44,21 @@ def _run_training():
 async def root():
     return {"status": "gesture backend is running"}
 
-
 @app.post("/register_face")
 async def register_face(username: str = Form(...), file: UploadFile = File(...)):
-    ext = Path(file.filename).suffix or ".jpg"
-    out_path = FACES_DIR / f"{username}{ext}"
-    with open(out_path, "wb") as buf:
-        shutil.copyfileobj(file.file, buf)
+    data = await file.read()
+    db = SessionLocal()
+    try:
+        db.query(Face).filter(Face.username == username).delete()
+        face = Face(username=username, image=data)
+        db.add(face)
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(500, "Database error saving face")
+    finally:
+        db.close()
     return {"message": f"Face for '{username}' registered successfully."}
-
 
 @app.post("/register_gesture")
 async def register_gesture(
@@ -79,69 +66,78 @@ async def register_gesture(
     key: str          = Form(...),
     files: List[UploadFile] = File(...)
 ):
-    # 1) Save originals
-    gesture_folder = GESTURES_DIR / gesture_name
-    gesture_folder.mkdir(parents=True, exist_ok=True)
-    saved = []
-    for idx, upload in enumerate(files, start=1):
-        ext = Path(upload.filename).suffix or ".jpg"
-        filename = f"orig_{idx}{ext}"
-        dest = gesture_folder / filename
-        with open(dest, "wb") as buf:
-            shutil.copyfileobj(upload.file, buf)
-        saved.append(dest.name)
+    db = SessionLocal()
+    try:
+        gesture = db.query(Gesture).filter_by(name=gesture_name).first()
+        if not gesture:
+            gesture = Gesture(name=gesture_name, key=key)
+            db.add(gesture)
+            db.flush()
+        else:
+            gesture.key = key
+            db.query(GestureImage).filter_by(gesture_id=gesture.id).delete()
 
-    # 2) Augment each original
-    for name in saved:
-        augment.augment_image(
-            input_path=str(gesture_folder / name),
-            output_dir=str(gesture_folder)
-        )
+        for upload in files:
+            content = await upload.read()
+            filename = Path(upload.filename).name
+            gi = GestureImage(
+                gesture_id=gesture.id,
+                filename=filename,
+                image=content
+            )
+            db.add(gi)
+        db.commit()
 
-    # 3) Update gestures.json
-    with open(GESTURES_JSON, "r+") as f:
-        data = json.load(f)
-        data[gesture_name] = {
-            "key": key,
-            "images": sorted(os.listdir(gesture_folder))
-        }
-        f.seek(0)
-        json.dump(data, f, indent=2)
-        f.truncate()
-
-    return {
-        "message": (
-            f"Gesture '{gesture_name}' registered: "
-            f"{len(saved)} originals + augmentations."
-        )
-    }
-
+        # Augmentations
+        for upload in files:
+            orig_bytes = await upload.read()
+            tmp_dir = Path(tempfile.mkdtemp())
+            in_path = tmp_dir / upload.filename
+            in_path.write_bytes(orig_bytes)
+            out_dir = tmp_dir / "aug"
+            out_dir.mkdir()
+            augment.augment_image(input_path=str(in_path), output_dir=str(out_dir))
+            for aug_file in sorted(out_dir.iterdir()):
+                aug_bytes = aug_file.read_bytes()
+                gi = GestureImage(
+                    gesture_id=gesture.id,
+                    filename=aug_file.name,
+                    image=aug_bytes
+                )
+                db.add(gi)
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(500, "Database error saving gesture")
+    finally:
+        db.close()
+    return {"message": f"Gesture '{gesture_name}' registered: {len(files)} originals + augmentations."}
 
 @app.post("/train_model")
 async def train_model(background_tasks: BackgroundTasks):
-    """
-    Kick off the PyTorch training script in the background.
-    Returns immediately so the front-end can show a spinner/poll status.
-    """
     background_tasks.add_task(_run_training)
     return {"status": "training_started"}
-
 
 @app.post("/predict")
 async def predict(keypoints: Keypoints):
     kp = keypoints.keypoints
     if len(kp) != 63:
-        raise HTTPException(status_code=400,
-            detail="Payload must contain 63 keypoint values.")
+        raise HTTPException(status_code=400, detail="Payload must contain 63 keypoint values.")
     gesture, binding = gesture_infer.predict_from_keypoints(kp)
     return {"gesture": gesture, "keybinding": binding}
 
-
 @app.get("/gestures")
 async def list_gestures():
-    with open(GESTURES_JSON) as f:
-        return json.load(f)
-
+    db = SessionLocal()
+    try:
+        gestures = db.query(Gesture).all()
+        result = []
+        for g in gestures:
+            imgs = [img.filename for img in g.images]
+            result.append({"gesture": g.name, "key": g.key, "images": imgs})
+        return result
+    finally:
+        db.close()
 
 # ─── Run locally with `uvicorn app:app --reload` ─────────────────────────────
 if __name__ == "__main__":
