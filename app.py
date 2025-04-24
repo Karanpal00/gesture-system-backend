@@ -56,7 +56,11 @@ def _run_training():
 # ─── Startup: create tables ────────────────────────────────────────────────────
 @app.on_event("startup")
 def on_startup():
-    Base.metadata.create_all(bind=engine)
+    try:
+        Base.metadata.create_all(bind=engine)
+    except Exception:
+        # we catch here so your app still comes up even if the DB is unreachable
+        pass
 
 # ─── Healthcheck ──────────────────────────────────────────────────────────────
 @app.get("/")
