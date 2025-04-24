@@ -7,7 +7,9 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base
 
-# Pull in your Render DATABASE_URL, ensure it ends with ?sslmode=require
+# ─── Pull in your Render DATABASE_URL ─────────────────────────────────────────
+# Make sure in your Render dashboard you've set:
+#   DATABASE_URL=postgresql://user:pass@host/dbname?sslmode=require
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable not set")
