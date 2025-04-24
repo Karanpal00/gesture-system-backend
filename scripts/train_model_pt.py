@@ -2,20 +2,23 @@
 """
 Train a lightweight MLP on hand-keypoint vectors with PyTorch,
 export to ONNX, and save scaler + label_map + binding_map.
-If no CSVs exist under data/processed/, it will first scan
-data/gestures/<gesture_name>/ for images, extract MediaPipe
+If no CSVs exist under data/processed/, it will first pull
+all images from the PostgreSQL database, extract MediaPipe
 hand landmarks, and produce a single CSV under data/processed/.
 Run: python scripts/train_model_pt.py
 """
+
 import os, pathlib
-os.environ["MPLCONFIGDIR"] = "/tmp/mpl"
+os.environ["MPLCONFIGDIR"] = "/tmp/mpl"  # writable cache for matplotlib
 import sys
 import logging
-import pathlib
 import pickle
 import json
 
-# ─── Ensure onnx is available ────────────────────────────────────────────────
+# Database imports
+from db import SessionLocal, Gesture, GestureImage
+
+# Ensure onnx is available
 try:
     import onnx
 except ModuleNotFoundError:
@@ -33,26 +36,25 @@ from sklearn.preprocessing import StandardScaler
 import cv2
 import mediapipe as mp
 
-# ─── Logging ────────────────────────────────────────────────────────────────
+# Logging setup
 logging.basicConfig(
     level=logging.INFO, format="[train_model] %(levelname)s: %(message)s"
 )
 
-# ─── Paths ─────────────────────────────────────────────────────────────────
+# Paths
 BASE_DIR      = pathlib.Path(__file__).parent.parent
-DATA_DIR      = BASE_DIR / "data"
-GESTURES_DIR  = DATA_DIR / "gestures"
-PROCESSED_DIR = DATA_DIR / "processed"
+PROCESSED_DIR = BASE_DIR / "data" / "processed"
 MODEL_DIR     = BASE_DIR / "models"
-GESTURES_JSON = DATA_DIR / "gestures.json"
 
-# ─── MediaPipe Hands Setup ─────────────────────────────────────────────────
-mp_hands      = mp.solutions.hands
-HANDS_CONFIG  = dict(static_image_mode=True,
-                     max_num_hands=1,
-                     min_detection_confidence=0.5)
+# MediaPipe Hands
+mp_hands     = mp.solutions.hands
+HANDS_CONFIG = dict(
+    static_image_mode=True,
+    max_num_hands=1,
+    min_detection_confidence=0.5
+)
 
-# ─── Model Definition ───────────────────────────────────────────────────────
+# Model definition
 class KeypointMLP(nn.Module):
     def __init__(self, in_dim: int, n_classes: int):
         super().__init__()
@@ -63,68 +65,52 @@ class KeypointMLP(nn.Module):
         )
     def forward(self, x): return self.net(x)
 
-# ─── Generate Dataset from Images ────────────────────────────────────────────
-def generate_dataset_csv() -> pathlib.Path:
-    logging.info("No CSVs found—generating dataset from images.")
-    if not GESTURES_DIR.exists():
-        raise FileNotFoundError(f"Gestures folder not found: {GESTURES_DIR}")
 
-    with open(GESTURES_JSON) as f:
-        gestures_meta = json.load(f)
-
+def generate_dataset_from_db() -> pathlib.Path:
+    logging.info("No CSVs found—generating dataset from DB images.")
+    session = SessionLocal()
     records = []
     hands_detector = mp_hands.Hands(**HANDS_CONFIG)
 
-    for gesture, info in gestures_meta.items():
-        binding = info["key"]
-        img_dir = GESTURES_DIR / gesture
-        if not img_dir.exists():
-            logging.warning(f"Skipping missing folder: {img_dir}")
-            continue
-
-        for img_path in sorted(img_dir.iterdir()):
-            if img_path.suffix.lower() not in {".jpg",".jpeg",".png"}:
+    for gesture in session.query(Gesture).all():
+        binding = gesture.key
+        for img in gesture.images:
+            arr = np.frombuffer(img.image, dtype=np.uint8)
+            img_cv = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img_cv is None:
+                logging.warning(f"Failed to decode {img.filename}; skipping")
                 continue
-
-            img = cv2.imread(str(img_path))
-            if img is None:
-                logging.warning(f"Cannot load image, skipping: {img_path}")
-                continue
-
-            results = hands_detector.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            results = hands_detector.process(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
             if not results.multi_hand_landmarks:
-                logging.warning(f"No hand detected in {img_path}, skipping")
+                logging.warning(f"No hand detected in {img.filename}; skipping")
                 continue
-
             lm = results.multi_hand_landmarks[0]
-            kp = []
-            for pt in lm.landmark:
-                kp.extend([pt.x, pt.y, pt.z])
-
-            rec = {"label": gesture, "binding": binding}
+            kp = [coord for pt in lm.landmark for coord in (pt.x, pt.y, pt.z)]
+            rec = {"label": gesture.name, "binding": binding}
             rec.update({f"kp{i}": float(k) for i, k in enumerate(kp)})
             records.append(rec)
 
     hands_detector.close()
+    session.close()
 
     if not records:
-        raise RuntimeError("No valid keypoint records generated from any image.")
+        raise RuntimeError("No valid keypoint records generated from any DB image.")
 
     df = pd.DataFrame.from_records(records)
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     out_csv = PROCESSED_DIR / "gestures_dataset.csv"
     df.to_csv(out_csv, index=False)
-    logging.info(f"Generated dataset CSV: {out_csv} ({len(df)} rows)")
+    logging.info(f"Generated dataset CSV from DB: {out_csv} ({len(df)} rows)")
     return out_csv
 
-# ─── Load Data (with auto-generate) ──────────────────────────────────────────
+
 def load_data():
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
     csvs = list(PROCESSED_DIR.glob("*.csv"))
     if not csvs:
-        csvs = [generate_dataset_csv()]
+        csvs = [generate_dataset_from_db()]
 
     frames = []
     for csv in csvs:
@@ -145,7 +131,7 @@ def load_data():
     binding_map = {row["label"]: row["binding"] for _, row in df.iterrows()}
     return X, y, label_map, binding_map
 
-# ─── Main Training + Export ─────────────────────────────────────────────────
+
 def main():
     try:
         logging.info("Loading data …")
@@ -154,8 +140,9 @@ def main():
         n_classes = len(label_map)
         logging.info(f"Dataset: {n_samples} samples, {n_features} features, {n_classes} classes")
 
-        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2,
-                                              stratify=y, random_state=42)
+        Xtr, Xte, ytr, yte = train_test_split(
+            X, y, test_size=0.2, stratify=y, random_state=42
+        )
         scaler = StandardScaler().fit(Xtr)
         Xtr_s = scaler.transform(Xtr)
         Xte_s = scaler.transform(Xte)
@@ -185,7 +172,6 @@ def main():
                     acc   = (preds == yte_t).float().mean().item() * 100
                 logging.info(f"Epoch {ep}/{epochs} — val acc: {acc:.2f}%")
 
-        # ─── Save PyTorch ────────────────────────────────────────────────────
         pt_path   = MODEL_DIR / "gesture_clf_pt.pt"
         onnx_path = MODEL_DIR / "gesture_clf_pt.onnx"
         meta_path = MODEL_DIR / "meta_pt.pkl"
@@ -193,7 +179,6 @@ def main():
         logging.info(f"Saving PyTorch model → {pt_path}")
         torch.save(model.state_dict(), pt_path)
 
-        # ─── Export to ONNX ─────────────────────────────────────────────────
         logging.info(f"Exporting ONNX model → {onnx_path}")
         try:
             dummy = torch.randn(1, n_features)
@@ -207,13 +192,12 @@ def main():
             logging.error(f"ONNX export failed: {e}")
             sys.exit(1)
 
-        # ─── Save metadata ───────────────────────────────────────────────────
         logging.info(f"Saving metadata → {meta_path}")
         with open(meta_path, "wb") as f:
             pickle.dump({
-                "scaler":       scaler,
-                "label_map":    label_map,
-                "binding_map":  binding_map
+                "scaler":      scaler,
+                "label_map":   label_map,
+                "binding_map": binding_map
             }, f)
 
         logging.info("✅ Training & export complete.")
