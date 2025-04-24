@@ -1,55 +1,63 @@
+# app.py
+
 import tempfile
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from pathlib import Path
+from fastapi import (
+    FastAPI, UploadFile, File, Form,
+    HTTPException, BackgroundTasks
+)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
-from pathlib import Path
-import subprocess, shutil, json, sys, os
 
-# ─── Database setup ────────────────────────────────────────────────────────────
 from db import engine, Base, SessionLocal, Face, Gesture, GestureImage
 from sqlalchemy.exc import SQLAlchemyError
 
-# Create tables on startup
+import augment         # your scripts/augment.py
+import gesture_infer   # inference/gesture_infer.py
+
+# Create tables at startup
 app = FastAPI(title="Gesture Control Backend")
 
 @app.on_event("startup")
 def create_tables():
     Base.metadata.create_all(bind=engine)
 
-# ─── CORS (explicit origins for credentials) ─────────────────────────────────
+
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5001",            # React dev server
-    ],
+    allow_origins=["http://localhost:5001"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ─── Data models ──────────────────────────────────────────────────────────────
+
 class Keypoints(BaseModel):
     keypoints: List[float]
 
-# ─── Utility to kick off training in background ───────────────────────────────
+
 def _run_training():
+    # runs in background, logs go to your service logs
     subprocess.run(
         [sys.executable, str(Path(__file__).parent / "scripts" / "train_model_pt.py")],
         capture_output=False,
         text=True
     )
 
-# ─── Endpoints ────────────────────────────────────────────────────────────────
+
 @app.get("/")
 async def root():
     return {"status": "gesture backend is running"}
+
 
 @app.post("/register_face")
 async def register_face(username: str = Form(...), file: UploadFile = File(...)):
     data = await file.read()
     db = SessionLocal()
     try:
+        # overwrite any existing
         db.query(Face).filter(Face.username == username).delete()
         face = Face(username=username, image=data)
         db.add(face)
@@ -61,6 +69,7 @@ async def register_face(username: str = Form(...), file: UploadFile = File(...))
         db.close()
     return {"message": f"Face for '{username}' registered successfully."}
 
+
 @app.post("/register_gesture")
 async def register_gesture(
     gesture_name: str = Form(...),
@@ -69,6 +78,7 @@ async def register_gesture(
 ):
     db = SessionLocal()
     try:
+        # upsert gesture
         gesture = db.query(Gesture).filter_by(name=gesture_name).first()
         if not gesture:
             gesture = Gesture(name=gesture_name, key=key)
@@ -76,71 +86,75 @@ async def register_gesture(
             db.flush()
         else:
             gesture.key = key
+            # clear old images
             db.query(GestureImage).filter_by(gesture_id=gesture.id).delete()
 
+        # process each upload
         for upload in files:
             content = await upload.read()
-            filename = Path(upload.filename).name
-            gi = GestureImage(
-                gesture_id=gesture.id,
-                filename=filename,
-                image=content
-            )
-            db.add(gi)
-        db.commit()
+            # write a temp copy for augment.py
+            tmp = Path(tempfile.mkdtemp())
+            orig_path = tmp / upload.filename
+            orig_path.write_bytes(content)
 
-        # Augmentations
-        for upload in files:
-            orig_bytes = await upload.read()
-            tmp_dir = Path(tempfile.mkdtemp())
-            in_path = tmp_dir / upload.filename
-            in_path.write_bytes(orig_bytes)
-            out_dir = tmp_dir / "aug"
-            out_dir.mkdir()
-            augment.augment_image(input_path=str(in_path), output_dir=str(out_dir))
-            for aug_file in sorted(out_dir.iterdir()):
-                aug_bytes = aug_file.read_bytes()
+            # augment into subdir
+            aug_dir = tmp / "aug"
+            aug_dir.mkdir()
+            augment.augment_image(input_path=str(orig_path), output_dir=str(aug_dir))
+
+            # save original + all augmentations in one go
+            for img_file in sorted([orig_path, *aug_dir.iterdir()]):
                 gi = GestureImage(
                     gesture_id=gesture.id,
-                    filename=aug_file.name,
-                    image=aug_bytes
+                    filename=img_file.name,
+                    image=img_file.read_bytes()
                 )
                 db.add(gi)
+
         db.commit()
-    except SQLAlchemyError:
+
+    except SQLAlchemyError as e:
         db.rollback()
-        raise HTTPException(500, "Database error saving gesture")
+        raise HTTPException(500, f"Database error saving gesture: {e}")
     finally:
         db.close()
-    return {"message": f"Gesture '{gesture_name}' registered: {len(files)} originals + augmentations."}
+
+    return {
+        "message": f"Gesture '{gesture_name}' registered: {len(files)} originals + augmentations."
+    }
+
 
 @app.post("/train_model")
 async def train_model(background_tasks: BackgroundTasks):
     background_tasks.add_task(_run_training)
     return {"status": "training_started"}
 
+
 @app.post("/predict")
 async def predict(keypoints: Keypoints):
     kp = keypoints.keypoints
     if len(kp) != 63:
-        raise HTTPException(status_code=400, detail="Payload must contain 63 keypoint values.")
+        raise HTTPException(400, "Payload must contain 63 keypoint values.")
     gesture, binding = gesture_infer.predict_from_keypoints(kp)
     return {"gesture": gesture, "keybinding": binding}
+
 
 @app.get("/gestures")
 async def list_gestures():
     db = SessionLocal()
     try:
-        gestures = db.query(Gesture).all()
-        result = []
-        for g in gestures:
-            imgs = [img.filename for img in g.images]
-            result.append({"gesture": g.name, "key": g.key, "images": imgs})
-        return result
+        out = []
+        for g in db.query(Gesture).all():
+            out.append({
+                "gesture": g.name,
+                "key": g.key,
+                "images": [img.filename for img in g.images]
+            })
+        return out
     finally:
         db.close()
 
-# ─── Run locally with `uvicorn app:app --reload` ─────────────────────────────
+
 if __name__ == "__main__":
-    import uvicorn
+    import uvicorn, sys, subprocess
     uvicorn.run("app:app", host="0.0.0.0", port=7860, reload=True)
